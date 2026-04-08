@@ -3,7 +3,7 @@
 use pa_types::{Cigar, CigarOp, Cost, Pos};
 
 use crate::{
-    Match, Searcher, Strand,
+    Match, RcSearchAble, Searcher, Strand,
     profiles::Profile,
     trace::{CostLookup, CostMatrix, fill},
 };
@@ -36,9 +36,9 @@ fn net_insertions_since_last_match(cigar: &Cigar) -> i32 {
 }
 
 /// (match_is_complete, (partial) match) -> continuation.
-pub trait Callback: FnMut(bool, &Match) -> Continuation {}
+pub trait Callback: FnMut(bool, &mut Match) -> Continuation {}
 
-impl<F: FnMut(bool, &Match) -> Continuation> Callback for F {}
+impl<F: FnMut(bool, &mut Match) -> Continuation> Callback for F {}
 
 impl<P: Profile> Searcher<P> {
     /// Iterate over _all_ alignments of cost up to `k`.
@@ -53,10 +53,10 @@ impl<P: Profile> Searcher<P> {
     /// If `prune_suboptimal` is `true`, path for which some part can be replaced by exact matches are skipped.
     /// E.g., if `====` is an option, this will skip over `=I=D=`, and similarly, this will prefer `===...` over `=I=...`.
     #[allow(clippy::too_many_arguments)]
-    pub fn iterate_all_alignments(
+    pub fn iterate_all_alignments<I: RcSearchAble + ?Sized>(
         &self,
         pattern: &[u8],
-        text: &[u8],
+        text: &I,
         k: usize,
         matches: &[Match],
         partial_matches: bool,
@@ -68,39 +68,44 @@ impl<P: Profile> Searcher<P> {
         // --- Forward strand ---
         let fwd: Vec<Match> = matches.iter().filter(|m| m.strand == Strand::Fwd).cloned().collect();
         if !fwd.is_empty() {
-            self.iterate_one_strand(pattern, text, k, &fwd, partial_matches, prune_suboptimal, callback);
+            self.iterate_one_strand(pattern, text.text().as_ref(), k, &fwd, partial_matches, prune_suboptimal, callback);
         }
 
         // --- Reverse-complement strand ---
-        let rc: Vec<Match> = matches.iter().filter(|m| m.strand == Strand::Rc).cloned().collect();
+        let mut rc: Vec<Match> = matches.iter().filter(|m| m.strand == Strand::Rc).cloned().collect();
         if !rc.is_empty() {
-            let fwd_len = text.len();
-            let rev_text: Vec<u8> = text.iter().rev().copied().collect();
+            let fwd_len = text.text().as_ref().len();
+            let rev_text = text.rev_text();
             let comp_pattern = P::complement(pattern);
 
-            // Translate RC matches from forward-text coords to reversed-text coords.
+            // Translate RC matches from forward-text coords to reversed-text coords, in place.
             // In forward space:  text_start, text_end
-            // In reversed space: text_end_rev = fwd_len - text_start
-            //                    text_start_rev = fwd_len - text_end
-            let mut rc_rev: Vec<Match> = rc.iter().map(|m| {
-                let mut tm = m.clone();
-                tm.text_end   = fwd_len - m.text_start;
-                tm.text_start = fwd_len - m.text_end;
-                tm.strand     = Strand::Fwd; // DFS operates on reversed text as if forward
-                tm
-            }).collect();
-            rc_rev.sort_by_key(|m| m.text_end);
+            // In reversed space: text_end_rev = fwd_len - text_start_fwd
+            //                    text_start_rev = fwd_len - text_end_fwd
+            for m in &mut rc {
+                let old_start = m.text_start;
+                m.text_start = fwd_len - m.text_end;
+                m.text_end   = fwd_len - old_start;
+                m.strand     = Strand::Fwd; // DFS operates on reversed text as if forward
+            }
+            rc.sort_by_key(|m| m.text_end);
 
             // Wrap callback: translate DFS results back to forward-text coords before firing.
-            let mut rc_callback = |complete: bool, m: &Match| -> Continuation {
-                let mut translated = m.clone();
-                translated.text_start = fwd_len - m.text_end;
-                translated.text_end   = fwd_len - m.text_start;
-                translated.strand     = Strand::Rc;
-                callback(complete, &translated)
+            // Modify in-place and restore to avoid cloning the Match (and its Cigar Vec).
+            let mut rc_callback = |complete: bool, m: &mut Match| -> Continuation {
+                let orig_start = m.text_start;
+                let orig_end   = m.text_end;
+                m.text_start = fwd_len - orig_end;
+                m.text_end   = fwd_len - orig_start;
+                m.strand     = Strand::Rc;
+                let result = callback(complete, m);
+                m.text_start = orig_start;
+                m.text_end   = orig_end;
+                m.strand     = Strand::Fwd;
+                result
             };
 
-            self.iterate_one_strand(&comp_pattern, &rev_text, k, &rc_rev,
+            self.iterate_one_strand(&comp_pattern, rev_text.as_ref(), k, &rc,
                                     partial_matches, prune_suboptimal, &mut rc_callback);
         }
     }
